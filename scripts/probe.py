@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-BIN = "/home/phaedrus/bosun-stage0/target/debug/bosun"
+BIN = "/home/phaedrus/.GH/Qompass/bosun/target/debug/bosun"
 META = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     "io.modelcontextprotocol/clientCapabilities": {},
@@ -73,7 +73,11 @@ def main():
           json.dumps(server_info))
 
     tools = responses.get(2, {}).get("result", {}).get("tools", [])
-    check("tools/list returns 9 tools", len(tools) == 9, f"got {len(tools)}")
+    check("tools/list returns 12 tools", len(tools) == 12, f"got {len(tools)}")
+    names = {t.get("name") for t in tools}
+    check("mdm group present",
+          {"bosun_mdm_enrollment_profile", "bosun_mdm_queue", "bosun_mdm_send_push"} <= names,
+          str(sorted(n for n in names if "mdm" in n)))
     check("every tool annotated",
           all(t.get("annotations", {}).get("readOnlyHint") is not None for t in tools))
     check("every inputSchema has properties",
@@ -87,12 +91,17 @@ def main():
           r3.get("error", {}).get("code") == -32022,
           json.dumps(r3)[:160])
 
+    # NOTE: requests are sent and awaited one at a time from here.
+    # The server executes calls concurrently, so pipelining
+    # dependent calls (list before/after a register) races.
     # 4. device list on the empty inventory
     send({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
           "params": {"name": "bosun_device_list", "arguments": {}, "_meta": META}})
+    read_until({4})
     # 5. gate check without approval and without device
     send({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
           "params": {"name": "bosun_gate_check", "arguments": {"action": "package_install"}, "_meta": META}})
+    read_until({5})
     # 6. register an android device WITH approval
     send({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
           "params": {"name": "bosun_device_register",
@@ -100,7 +109,7 @@ def main():
                                    "transport": "100.100.21.122:5555",
                                    "operator_approval": {"approved_by": "probe"}},
                      "_meta": META}})
-    read_until({4, 5, 6})
+    read_until({6})
 
     def tool_body(resp_id):
         msg = responses.get(resp_id, {})
@@ -121,16 +130,70 @@ def main():
     send({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
           "params": {"name": "bosun_package_install",
                      "arguments": {"device_id": "flip7", "package": "x.apk"}, "_meta": META}})
+    read_until({7})
     # 8. list again -> total 1
     send({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
           "params": {"name": "bosun_device_list", "arguments": {}, "_meta": META}})
-    read_until({7, 8})
+    read_until({8})
     body, is_err = tool_body(7)
     check("install without approval denied by gate",
           is_err and body.get("error", {}).get("code") == "operator_approval_required",
           json.dumps(body)[:160])
     body, _ = tool_body(8)
     check("device_list after register: total 1", body.get("total") == 1, json.dumps(body)[:120])
+
+    # 9. register an iOS device (unenrolled by default)
+    send({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+          "params": {"name": "bosun_device_register",
+                     "arguments": {"id": "probe-iphone", "label": "Probe iPhone", "platform": "ios",
+                                   "transport": "UDID-PROBE",
+                                   "operator_approval": {"approved_by": "probe"}},
+                     "_meta": META}})
+    read_until({9})
+    # 10. enrollment profile WITHOUT approval -> gate denial
+    send({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+          "params": {"name": "bosun_mdm_enrollment_profile",
+                     "arguments": {"device_id": "probe-iphone", "enrollment": "enrolled_supervised"},
+                     "_meta": META}})
+    read_until({10})
+    # 11. enrollment profile WITH approval -> session + profile
+    send({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+          "params": {"name": "bosun_mdm_enrollment_profile",
+                     "arguments": {"device_id": "probe-iphone", "enrollment": "enrolled_supervised",
+                                   "operator_approval": {"approved_by": "probe"}},
+                     "_meta": META}})
+    read_until({11})
+    # 12. mdm queue readback (the session exists; no commands yet)
+    send({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+          "params": {"name": "bosun_mdm_queue", "arguments": {}, "_meta": META}})
+    read_until({12})
+    # 13. gate_check push_wake on the unenrolled device -> capability denial
+    send({"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+          "params": {"name": "bosun_gate_check",
+                     "arguments": {"action": "push_wake", "device_id": "probe-iphone",
+                                   "operator_approval": {"approved_by": "probe"}},
+                     "_meta": META}})
+    read_until({13})
+    body, is_err = tool_body(9)
+    check("register ios succeeds as unenrolled",
+          not is_err and body.get("enrollment") == "unenrolled", json.dumps(body)[:120])
+    body, is_err = tool_body(10)
+    check("enrollment profile without approval denied",
+          is_err and body.get("error", {}).get("code") == "operator_approval_required",
+          json.dumps(body)[:160])
+    body, is_err = tool_body(11)
+    check("enrollment profile with approval opens a session",
+          not is_err and bool(body.get("session_token"))
+          and "com.apple.mdm" in body.get("profile", ""),
+          json.dumps(body)[:160])
+    body, is_err = tool_body(12)
+    check("mdm_queue reads back empty commands",
+          not is_err and body.get("commands") == [] and body.get("devices") == [],
+          json.dumps(body)[:120])
+    body, _ = tool_body(13)
+    check("gate_check push_wake on unenrolled denies capability",
+          body.get("decision") == "deny" and body.get("code") == "capability_not_declared",
+          json.dumps(body)[:160])
 
     proc.stdin.close()
     try:
