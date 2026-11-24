@@ -1,8 +1,10 @@
 //! The declared tool surface. Schemas and annotations are born
 //! with the tools (Tiger Style MCP Rules 3 and 5): every input
 //! schema is an object with an explicit `properties` key, and
-//! every tool declares its access hints. The surface is 9 tools
-//! in 5 role-shaped groups — well inside the 25-tool budget.
+//! every tool declares its access hints. The surface is 12
+//! tools in 6 role-shaped groups — well inside the 25-tool
+//! budget. Stage 1 adds the `mdm` group: the enrollment-profile
+//! generator, the command-queue readback, and the APNs wake.
 //!
 //! No `outputSchema` is published at Stage 0: backend results
 //! carry platform output whose shape is not yet stable, and a
@@ -63,6 +65,7 @@ fn approval_prop() -> Value {
         "properties": {
             "approved_by": {"type": "string"},
             "note": {"type": "string"},
+            "token": {"type": "string", "description": "Approval-channel token from `bosun approve`; required on servers holding an approval key."},
         },
         "required": ["approved_by"],
         "additionalProperties": false,
@@ -196,6 +199,43 @@ pub fn specs() -> Vec<ToolSpec> {
             kind: Kind::Mutation(Action::Reboot),
         },
         ToolSpec {
+            name: "bosun_mdm_enrollment_profile",
+            group: "mdm",
+            description: "Generate the .mobileconfig enrollment profile for an inventoried iOS device and open its one-shot enrollment session. A mutation: requires operator approval. The profile carries the server URL, the push topic (placeholder until the real certificate lands), and the SCEP endpoint; the device's first check-in spends the session.",
+            input: obj_schema(
+                &[
+                    device_id(),
+                    (
+                        "enrollment",
+                        json!({"type": "string", "enum": ["enrolled_unsupervised", "enrolled_supervised"]}),
+                    ),
+                    (APPROVAL, approval_prop()),
+                ],
+                &["device_id", "enrollment", APPROVAL],
+            ),
+            annotations: write_ann(false, false),
+            kind: Kind::Mutation(Action::EnrollDevice),
+        },
+        ToolSpec {
+            name: "bosun_mdm_queue",
+            group: "mdm",
+            description: "Read the MDM state: enrolled devices (push-credential presence only, never values) and command records with their states and recorded responses. Read-only and ungated.",
+            input: obj_schema(&[device_id()], &[]),
+            annotations: read_ann(),
+            kind: Kind::Read,
+        },
+        ToolSpec {
+            name: "bosun_mdm_send_push",
+            group: "mdm",
+            description: "Send an APNs wake-up push to an enrolled iOS device so it checks in and picks up queued commands. A mutation: requires operator approval and the diagnostics capability. Refuses typed errors when the device has not stored push credentials or no push certificate is configured.",
+            input: obj_schema(
+                &[device_id(), (APPROVAL, approval_prop())],
+                &["device_id", APPROVAL],
+            ),
+            annotations: write_ann(true, false),
+            kind: Kind::Mutation(Action::PushWake),
+        },
+        ToolSpec {
             name: "bosun_gate_check",
             group: "gate",
             description: "Ask the mutation gate for its verdict on an action (and optionally a device and approval) without performing it. Read-only; the answer is the same decision a real call would meet.",
@@ -203,7 +243,7 @@ pub fn specs() -> Vec<ToolSpec> {
                 &[
                     (
                         "action",
-                        json!({"type": "string", "enum": ["register_device", "package_install", "package_update", "reboot"]}),
+                        json!({"type": "string", "enum": ["register_device", "enroll_device", "package_install", "package_update", "reboot", "push_wake"]}),
                     ),
                     device_id(),
                     (APPROVAL, approval_prop()),
@@ -237,13 +277,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn surface_is_nine_tools_uniquely_named_and_prefixed() {
+    fn surface_is_twelve_tools_uniquely_named_and_prefixed() {
         let all = specs();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 12);
         let mut names: Vec<&str> = all.iter().map(|s| s.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 12);
         assert!(names.iter().all(|n| n.starts_with("bosun_")));
     }
 
@@ -288,13 +328,20 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_the_five_declared() {
+    fn groups_are_the_six_declared() {
         let mut groups: Vec<&str> = specs().iter().map(|s| s.group).collect();
         groups.sort_unstable();
         groups.dedup();
         assert_eq!(
             groups,
-            ["diagnostics", "gate", "inventory", "packages", "power"]
+            [
+                "diagnostics",
+                "gate",
+                "inventory",
+                "mdm",
+                "packages",
+                "power"
+            ]
         );
     }
 

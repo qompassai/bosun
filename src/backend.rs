@@ -8,11 +8,12 @@
 //!   stage performs no device contact.
 //! - Windows: REAL command paths over `ssh` + `winget`. Same
 //!   exercise status as Android.
-//! - iOS: the MDM queue seam. Commands enqueue and are reported
-//!   as queued; delivery (check-in endpoint + APNs) is Stage 1,
-//!   so every iOS operation that would touch a device answers
-//!   with the typed `stage1_not_live` error rather than a
-//!   fabricated success.
+//! - iOS: the MDM state seam (Stage 1). Operations enqueue a
+//!   command in the persisted MDM state and are reported as
+//!   queued with the command UUID; the check-in endpoint
+//!   (`mdmhttp`) delivers on the device's next poll and records
+//!   its response against the queue record. Nothing claims a
+//!   device acted until that response lands.
 //!
 //! Every external command runs under a hard timeout and a hard
 //! output bound. A backend failure is an execution error value,
@@ -24,7 +25,8 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 
 use crate::capability::{DeviceRecord, Platform};
-use crate::mdm::{CommandQueue, MdmCommandKind};
+use crate::mdm::MdmCommandKind;
+use crate::mdmstate::MdmState;
 
 /// Bound on one backend command's wall clock.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,7 +57,7 @@ pub type BackendResult = Result<Value, BackendError>;
 /// backend (never caller input); `args` may carry device data
 /// (transports, package ids) and are passed as argv, never through
 /// a shell.
-async fn run_bounded(program: &str, args: &[String]) -> BackendResult {
+pub(crate) async fn run_bounded(program: &str, args: &[String]) -> BackendResult {
     let fut = tokio::process::Command::new(program).args(args).output();
     let output = match timeout(COMMAND_TIMEOUT, fut).await {
         Ok(Ok(out)) => out,
@@ -272,70 +274,49 @@ impl Backend for WindowsBackend {
     }
 }
 
-/// iOS over the MDM queue. Stage 0: commands enqueue against the
-/// device UDID and the result says exactly that — `queued`, with
-/// the command UUID — for operations the queue can carry, and the
-/// typed Stage 1 error where even queueing would be a lie
-/// (nothing delivers yet, so a "queued" diagnostics request would
-/// never answer; reads therefore refuse honestly instead).
+/// iOS over the persisted MDM state. Commands enqueue against
+/// the device UDID and the result says exactly that — `queued`,
+/// with the command UUID. Delivery happens when the device next
+/// checks in to the MDM endpoint; its response is recorded
+/// against the same record.
 pub struct IosMdmBackend {
-    pub queue: std::sync::Mutex<CommandQueue>,
+    home: std::path::PathBuf,
 }
 
 impl IosMdmBackend {
-    pub fn new() -> IosMdmBackend {
-        IosMdmBackend {
-            queue: std::sync::Mutex::new(CommandQueue::new()),
-        }
-    }
-
-    fn stage1_error(what: &str) -> BackendError {
-        BackendError::new(
-            "stage1_not_live",
-            format!(
-                "{what} requires the MDM check-in endpoint and APNs push, which land in Stage 1 (see STAGE0.md)"
-            ),
-        )
+    pub fn new(home: std::path::PathBuf) -> IosMdmBackend {
+        IosMdmBackend { home }
     }
 
     fn enqueue(&self, device: &DeviceRecord, kind: MdmCommandKind) -> BackendResult {
-        let mut queue = self.queue.lock().map_err(|_| {
-            BackendError::new(
-                "queue_unavailable",
-                "MDM command queue lock is poisoned".to_string(),
-            )
-        })?;
-        match queue.enqueue(&device.transport, kind) {
-            Some(uuid) => Ok(json!({
-                "device": device.id,
-                "delivery": "queued",
-                "command_uuid": uuid,
-                "note": "queued only: no check-in endpoint exists until Stage 1, so the device has not received this command",
-            })),
-            None => Err(BackendError::new(
-                "queue_full",
-                format!(
-                    "MDM command queue is at its bound of {}",
-                    crate::mdm::MAX_QUEUED_COMMANDS
-                ),
-            )),
-        }
-    }
-}
-
-impl Default for IosMdmBackend {
-    fn default() -> Self {
-        Self::new()
+        let mut state =
+            MdmState::load(&self.home).map_err(|e| BackendError::new(e.code, e.message))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let uuid = state
+            .enqueue(&device.transport, kind, now)
+            .map_err(|e| BackendError::new(e.code, e.message))?;
+        state
+            .save()
+            .map_err(|e| BackendError::new(e.code, e.message))?;
+        Ok(json!({
+            "device": device.id,
+            "delivery": "queued",
+            "command_uuid": uuid,
+            "note": "queued in the MDM state; the device receives it at its next check-in (wake it with bosun_mdm_send_push) and the response lands against this record — read it with bosun_mdm_queue",
+        }))
     }
 }
 
 impl Backend for IosMdmBackend {
-    async fn diagnostics(&self, _device: &DeviceRecord) -> BackendResult {
-        Err(Self::stage1_error("iOS diagnostics (DeviceInformation)"))
+    async fn diagnostics(&self, device: &DeviceRecord) -> BackendResult {
+        self.enqueue(device, MdmCommandKind::DeviceInformation)
     }
 
-    async fn package_list(&self, _device: &DeviceRecord) -> BackendResult {
-        Err(Self::stage1_error("iOS installed-application query"))
+    async fn package_list(&self, device: &DeviceRecord) -> BackendResult {
+        self.enqueue(device, MdmCommandKind::InstalledApplicationList)
     }
 
     async fn package_install(&self, device: &DeviceRecord, package: &str) -> BackendResult {
@@ -365,10 +346,13 @@ impl Backend for IosMdmBackend {
     }
 
     async fn reboot(&self, _device: &DeviceRecord) -> BackendResult {
-        // The capability model does not declare Reboot for iOS at
-        // Stage 0, so the gate refuses before this is reached; the
-        // arm exists to keep the trait total.
-        Err(Self::stage1_error("iOS restart (RestartDevice)"))
+        // The capability model does not declare Reboot for iOS,
+        // so the gate refuses before this is reached; the arm
+        // exists to keep the trait total.
+        Err(BackendError::new(
+            "capability_not_declared",
+            "iOS devices do not declare the reboot capability".to_string(),
+        ))
     }
 }
 
@@ -381,11 +365,11 @@ pub struct Backends {
 }
 
 impl Backends {
-    pub fn new() -> Backends {
+    pub fn new(home: std::path::PathBuf) -> Backends {
         Backends {
             android: AndroidBackend,
             windows: WindowsBackend,
-            ios: IosMdmBackend::new(),
+            ios: IosMdmBackend::new(home),
         }
     }
 
@@ -434,11 +418,5 @@ impl Backends {
             Platform::Windows => self.windows.reboot(device).await,
             Platform::Ios => self.ios.reboot(device).await,
         }
-    }
-}
-
-impl Default for Backends {
-    fn default() -> Self {
-        Self::new()
     }
 }

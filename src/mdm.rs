@@ -1,18 +1,21 @@
 //! The iOS MDM model: check-in kinds, the command vocabulary, and
-//! the per-device command queue. Stage 0 defines the types and the
-//! queue; the HTTPS check-in endpoint, SCEP, and APNs push that
-//! move commands to devices are Stage 1 (see STAGE0.md). Nothing
-//! in this module pretends a command has reached a device: queue
-//! entries are `Queued` until a check-in delivers them, and no
-//! delivery path exists yet.
-
-// The MDM vocabulary is Stage-1-facing API: it is fully unit-
-// tested here, and the check-in endpoint that consumes it lands
-// in Stage 1. Dead-code warnings against it are expected until
-// then; everything else in the crate stays warning-clean.
+//! the per-device command queue. Stage 0 defined the types and
+//! the queue; Stage 1 lands the consumers — the check-in endpoint
+//! (`mdmhttp`), the persisted command records (`mdmstate`), and
+//! APNs push (`apns`). Nothing in this module pretends a command
+//! has reached a device: a command is `Queued` until a check-in
+//! delivers it, and the record of that lives in `mdmstate`.
+//!
+//! `CommandQueue` below is the Stage 0 in-memory queue, retained
+//! as the vocabulary model and for its tests; the live path uses
+//! the persisted records, whose FIFO-per-device semantics mirror
+//! it. Dead-code allowances cover the parts of the vocabulary
+//! Stage 1 defines but only the real-device gate will exercise.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
+
+use serde_json::{Value, json};
 
 /// MDM check-in message kinds (the `MessageType` values a device
 /// posts to the check-in endpoint), plus the idle poll a device
@@ -92,6 +95,85 @@ impl MdmCommandKind {
                 | MdmCommandKind::ScheduleOsUpdate
                 | MdmCommandKind::RestartDevice
         )
+    }
+
+    /// Render the command as the plist value the server endpoint
+    /// hands a checking-in device: `{CommandUUID, Command}`. This
+    /// is the one place command bodies are shaped, so the enqueue
+    /// path can validate renderability up front (a malformed
+    /// install identifier refuses at enqueue, not at delivery).
+    pub fn to_command_value(&self, command_uuid: &str) -> Result<Value, CommandError> {
+        let command = match self {
+            MdmCommandKind::DeviceInformation => json!({
+                "RequestType": "DeviceInformation",
+                "Queries": [
+                    "AvailableDeviceCapacity", "BatteryLevel", "BuildVersion",
+                    "DeviceCapacity", "DeviceName", "IsSupervised", "ModelName",
+                    "OSVersion", "ProductName", "SerialNumber", "UDID",
+                ],
+            }),
+            MdmCommandKind::InstalledApplicationList => json!({
+                "RequestType": "InstalledApplicationList",
+                "IdentifiersOnly": false,
+            }),
+            MdmCommandKind::InstallProfile => {
+                return Err(CommandError::new(
+                    "command_unrenderable",
+                    "InstallProfile needs a profile payload; Stage 1 queues no profile installs",
+                ));
+            }
+            MdmCommandKind::InstallApplication { identifier } => {
+                if let Ok(store_id) = identifier.parse::<u64>() {
+                    json!({
+                        "RequestType": "InstallApplication",
+                        "iTunesStoreID": store_id,
+                    })
+                } else if identifier.starts_with("https://") {
+                    json!({
+                        "RequestType": "InstallApplication",
+                        "ManifestURL": identifier,
+                    })
+                } else {
+                    return Err(CommandError::new(
+                        "command_unrenderable",
+                        format!(
+                            "InstallApplication identifier {identifier:?} is neither a store id nor an https manifest URL"
+                        ),
+                    ));
+                }
+            }
+            MdmCommandKind::RemoveApplication { identifier } => json!({
+                "RequestType": "RemoveApplication",
+                "Identifier": identifier,
+            }),
+            MdmCommandKind::ScheduleOsUpdate => json!({
+                "RequestType": "ScheduleOSUpdate",
+                "InstallAction": "Default",
+            }),
+            MdmCommandKind::RestartDevice => json!({ "RequestType": "RestartDevice" }),
+            MdmCommandKind::RestrictionsQuery => json!({ "RequestType": "Restrictions" }),
+        };
+        Ok(json!({
+            "CommandUUID": command_uuid,
+            "Command": command,
+        }))
+    }
+}
+
+/// A command that cannot be rendered for delivery. Typed, like
+/// every other refusal in the crate.
+#[derive(Debug)]
+pub struct CommandError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CommandError {
+    fn new(code: &'static str, message: impl Into<String>) -> CommandError {
+        CommandError {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -199,6 +281,56 @@ mod tests {
         );
         assert!(MdmCommandKind::ScheduleOsUpdate.requires_supervision());
         assert!(MdmCommandKind::RestartDevice.requires_supervision());
+    }
+
+    #[test]
+    fn commands_render_their_wire_shape() {
+        let info = MdmCommandKind::DeviceInformation
+            .to_command_value("bosun-cmd-000001")
+            .expect("renders");
+        assert_eq!(info["CommandUUID"], "bosun-cmd-000001");
+        assert_eq!(info["Command"]["RequestType"], "DeviceInformation");
+        assert!(
+            info["Command"]["Queries"]
+                .as_array()
+                .expect("queries")
+                .iter()
+                .any(|q| q == "IsSupervised")
+        );
+        let store_app = MdmCommandKind::InstallApplication {
+            identifier: "123456789".into(),
+        }
+        .to_command_value("u2")
+        .expect("store id renders");
+        assert_eq!(store_app["Command"]["iTunesStoreID"], 123456789);
+        let manifest = MdmCommandKind::InstallApplication {
+            identifier: "https://example.invalid/app.plist".into(),
+        }
+        .to_command_value("u3")
+        .expect("manifest renders");
+        assert_eq!(
+            manifest["Command"]["ManifestURL"],
+            "https://example.invalid/app.plist"
+        );
+    }
+
+    #[test]
+    fn unrenderable_commands_refuse_at_render() {
+        // Adversarial: a free-form identifier is neither a store
+        // id nor a manifest URL; it must fail here, at enqueue
+        // time, not on the device.
+        let bad = MdmCommandKind::InstallApplication {
+            identifier: "not an app".into(),
+        };
+        assert_eq!(
+            bad.to_command_value("u").expect_err("must refuse").code,
+            "command_unrenderable"
+        );
+        assert!(
+            MdmCommandKind::InstallProfile
+                .to_command_value("u")
+                .is_err()
+        );
     }
 
     #[test]

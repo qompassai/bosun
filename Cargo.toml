@@ -12,6 +12,11 @@ serde_json = "1"
 # modern era only (2026-07-28). Bumps are single fleet events.
 rmcp = { version = "=3.8.0", default-features = false, features = ["server"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+# Stage 1: TLS for the MDM HTTPS endpoints. Ring provider only,
+# no aws-lc-rs: the estate builds offline from the local registry
+# cache, and ring is the provider that cache carries end to end.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
 
 [profile.release]
 lto = true

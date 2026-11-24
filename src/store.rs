@@ -106,6 +106,16 @@ impl Store {
         Ok(Store { path, inventory })
     }
 
+    /// The server home: the directory holding the inventory
+    /// file, and therefore every other per-server state file
+    /// (MDM state, approval key, profiles).
+    pub fn home_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     pub fn list(&self) -> &[DeviceRecord] {
         &self.inventory.devices
     }
