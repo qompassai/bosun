@@ -15,7 +15,7 @@
       }
     }
   },
-  "description": "Qompass remote device provisioning MCP: device inventory and diagnostics for Android, Windows, and iOS, with operator-gated package install/update and reboot, and a full MDM for iOS.",
+  "description": "Remote device provisioning MCP: inventory, diagnostics, operator-gated installs, full iOS MDM.",
   "name": "ai.qompass/bosun",
   "repository": {
     "source": "github",
