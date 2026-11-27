@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-11-27
+
+Patch: publish-metadata correction — the crates.io publish wire format
+carries the README text itself in the metadata `readme` field; 0.1.2
+sent the filename, so crates.io served a 17-byte readme and the MCP
+Registry's mcp-name ownership validation still could not pass.
+No code changes.
+
 ## 0.1.2 — 2026-11-27
 
 Patch: declares `readme = "README.md"` in the manifest so crates.io
