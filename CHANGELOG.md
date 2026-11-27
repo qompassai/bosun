@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-11-27
+
+Patch: adds the `mcp-name: ai.qompass/bosun` ownership marker to the
+README, which the MCP Registry requires to validate the crates.io
+package against this server name. No code changes.
+
 ## 0.1.0 — 2026-11-27
 
 First release. Remote device provisioning MCP: device inventory and

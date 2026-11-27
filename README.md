@@ -1,5 +1,6 @@
 # Bosun
 
+mcp-name: ai.qompass/bosun
 Qompass AI's remote device provisioning MCP server — the boatswain
 for the household fleet: one surface that inventories devices,
 collects their diagnostics, and (only ever through an

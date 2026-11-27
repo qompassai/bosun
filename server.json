@@ -22,7 +22,7 @@
     "url": "https://github.com/qompassai/bosun"
   },
   "title": "Bosun",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://qompass.ai/solutions/bosun/",
   "packages": [
     {
@@ -31,7 +31,7 @@
       "transport": {
         "type": "stdio"
       },
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }
