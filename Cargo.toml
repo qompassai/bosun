@@ -20,3 +20,7 @@ rustls-pki-types = "1"
 
 [profile.release]
 lto = true
+
+[[bench]]
+name = "hot_paths"
+harness = false
