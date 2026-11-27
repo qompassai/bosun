@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-11-27
+
+Patch: declares `readme = "README.md"` in the manifest so crates.io
+serves the README (0.1.1's publish metadata omitted it, so the MCP
+Registry's ownership validation could not see the mcp-name marker).
+No code changes.
+
 ## 0.1.1 — 2026-11-27
 
 Patch: adds the `mcp-name: ai.qompass/bosun` ownership marker to the
